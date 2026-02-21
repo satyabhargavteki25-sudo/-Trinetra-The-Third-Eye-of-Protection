@@ -1,0 +1,776 @@
+import cv2
+import numpy as np
+from mss import mss
+from ultralytics import YOLO
+import time
+import winsound
+from datetime import datetime
+import os
+from pathlib import Path
+import subprocess
+import sys
+import threading
+from flask import Flask, Response, render_template_string, jsonify
+import socket
+import requests
+import zipfile
+import shutil
+
+# ===============================
+# CONFIGURATION
+# ===============================
+CONFIG = {
+    # Screen capture
+    "screen_region": {"top": 100, "left": 600, "width": 640, "height": 480},
+    
+    # Web server
+    "web_host": "0.0.0.0",
+    "web_port": 5000,
+    
+    # Detection
+    "confidence": 0.25,
+    
+    # Auto-download
+    "auto_download": True,
+}
+
+# ===============================
+# AUTO-DOWNLOAD PRETRAINED MODELS
+# ===============================
+def download_file(url, filename):
+    """Download file with progress"""
+    print(f"   Downloading {filename}...")
+    response = requests.get(url, stream=True)
+    total_size = int(response.headers.get('content-length', 0))
+    
+    with open(filename, 'wb') as f:
+        downloaded = 0
+        for data in response.iter_content(chunk_size=4096):
+            downloaded += len(data)
+            f.write(data)
+            if total_size > 0:
+                percent = (downloaded / total_size) * 100
+                print(f"   Progress: {percent:.1f}%", end='\r')
+    print(f"   ✅ Downloaded {filename}")
+
+def download_pretrained_models():
+    """Download all required pretrained models"""
+    print("\n" + "=" * 60)
+    print("📥 AUTO-DOWNLOADING PRETRAINED MODELS")
+    print("=" * 60)
+    
+    # Create models directory
+    Path("models").mkdir(exist_ok=True)
+    
+    # 1. YOLOv8 for human detection
+    if not Path("yolov8n.pt").exists():
+        print("\n1️⃣ Downloading YOLOv8 human detection model...")
+        download_file(
+            "https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt",
+            "yolov8n.pt"
+        )
+    
+    # 2. Age detection model (pretrained)
+    if not Path("models/age_deploy.prototxt").exists():
+        print("\n2️⃣ Downloading age detection model...")
+        download_file(
+            "https://raw.githubusercontent.com/GilLevi/AgeGenderDeepLearning/master/deploy_age.prototxt",
+            "models/age_deploy.prototxt"
+        )
+        download_file(
+            "https://www.dropbox.com/s/xfb20y596869vbb/age_net.caffemodel?dl=1",
+            "models/age_net.caffemodel"
+        )
+    
+    # 3. Gender detection model (pretrained)
+    if not Path("models/gender_deploy.prototxt").exists():
+        print("\n3️⃣ Downloading gender detection model...")
+        download_file(
+            "https://raw.githubusercontent.com/GilLevi/AgeGenderDeepLearning/master/deploy_gender.prototxt",
+            "models/gender_deploy.prototxt"
+        )
+        download_file(
+            "https://www.dropbox.com/s/iyv483wz7ztr9gh/gender_net.caffemodel?dl=1",
+            "models/gender_net.caffemodel"
+        )
+    
+    # 4. Activity recognition model
+    if not Path("models/activity_model.pth").exists():
+        print("\n4️⃣ Downloading activity recognition model...")
+        download_file(
+            "https://github.com/opencv/opencv_extra/raw/master/testdata/dnn/activity_recognition_model.pb",
+            "models/activity_model.pb"
+        )
+    
+    print("\n✅ All models downloaded successfully!")
+
+# ===============================
+# ENHANCED DETECTOR CLASS
+# ===============================
+class EnhancedDetector:
+    def __init__(self):
+        print("\n📦 Loading models...")
+        
+        # Main YOLO for human detection
+        self.model = YOLO("yolov8n.pt")
+        
+        # Age and Gender models (OpenCV DNN)
+        self.age_net = cv2.dnn.readNetFromCaffe(
+            "models/age_deploy.prototxt",
+            "models/age_net.caffemodel"
+        )
+        self.gender_net = cv2.dnn.readNetFromCaffe(
+            "models/gender_deploy.prototxt",
+            "models/gender_net.caffemodel"
+        )
+        
+        # Age categories
+        self.age_list = ['(0-2)', '(4-6)', '(8-12)', '(15-20)', 
+                        '(25-32)', '(38-43)', '(48-53)', '(60-100)']
+        
+        # Gender categories
+        self.gender_list = ['Male', 'Female']
+        
+        # Activity classes (simplified for demo)
+        self.activities = ['standing', 'walking', 'running', 'sitting', 
+                          'lying', 'waving', 'pointing', 'carrying']
+        
+        # Size categories with distance
+        self.size_categories = {
+            "tiny": {"range": (5, 20), "color": (0, 0, 255), "distance": "200m"},
+            "small": {"range": (20, 40), "color": (0, 165, 255), "distance": "150m"},
+            "medium": {"range": (40, 80), "color": (0, 255, 255), "distance": "100m"},
+            "large": {"range": (80, 150), "color": (0, 255, 0), "distance": "50m"},
+            "xlarge": {"range": (150, 2000), "color": (255, 0, 255), "distance": "<20m"}
+        }
+        
+        # Statistics with new fields
+        self.stats = {
+            'total': 0,
+            'tiny': 0, 'small': 0, 'medium': 0, 'large': 0, 'xlarge': 0,
+            'boys': 0,
+            'girls': 0,
+            'men': 0,
+            'women': 0,
+            'infants': 0,
+            'children': 0,
+            'adults': 0,
+            'elderly': 0,
+            'activities': {}
+        }
+        
+        self.last_detections = []
+        self.avg_confidence = 0.0
+        print("✅ Enhanced detector ready")
+    
+    def estimate_age_gender(self, face_roi):
+        """Estimate age and gender from face region"""
+        if face_roi.size == 0:
+            return "Unknown", "Unknown", "Unknown"
+        
+        try:
+            # Prepare blob for gender detection
+            blob = cv2.dnn.blobFromImage(face_roi, 1.0, (227, 227),
+                                        (78.4263377603, 87.7689143744, 114.895847746),
+                                        swapRB=False)
+            
+            # Predict gender
+            self.gender_net.setInput(blob)
+            gender_preds = self.gender_net.forward()
+            gender = self.gender_list[gender_preds[0].argmax()]
+            
+            # Predict age
+            self.age_net.setInput(blob)
+            age_preds = self.age_net.forward()
+            age_range = self.age_list[age_preds[0].argmax()]
+            
+            # Convert age range to category
+            age_num = int(age_range.strip('()').split('-')[0])
+            if age_num < 4:
+                age_category = "Infant"
+            elif age_num < 12:
+                age_category = "Child"
+            elif age_num < 20:
+                age_category = "Teen"
+            elif age_num < 60:
+                age_category = "Adult"
+            else:
+                age_category = "Elderly"
+            
+            return gender, age_range, age_category
+            
+        except:
+            return "Unknown", "Unknown", "Unknown"
+    
+    def estimate_activity(self, prev_pos, curr_pos, bbox_size):
+        """Estimate activity based on movement and position"""
+        if prev_pos is None:
+            return "standing"
+        
+        # Calculate movement
+        dx = curr_pos[0] - prev_pos[0]
+        dy = curr_pos[1] - prev_pos[1]
+        movement = np.sqrt(dx**2 + dy**2)
+        
+        # Activity classification based on movement
+        if movement < 2:
+            return "standing"
+        elif movement < 5:
+            return "walking"
+        elif movement < 10:
+            return "jogging"
+        else:
+            return "running"
+    
+    def detect(self, frame):
+        # Store previous positions for activity detection
+        if not hasattr(self, 'prev_positions'):
+            self.prev_positions = {}
+        
+        results = self.model(frame, conf=CONFIG["confidence"], verbose=False, classes=[0])
+        
+        # Reset stats
+        for key in self.stats:
+            if key != 'activities':
+                self.stats[key] = 0
+        self.stats['activities'] = {}
+        
+        detections = []
+        total_conf = 0.0
+        
+        for r in results:
+            for idx, box in enumerate(r.boxes):
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                conf = float(box.conf[0])
+                size = max(x2 - x1, y2 - y1)
+                
+                # Get size category
+                cat, info = self.get_category(size)
+                self.stats[cat] += 1
+                
+                # Extract face region for age/gender (upper part of bbox)
+                face_roi = frame[y1:y1 + (y2-y1)//3, x1:x2]
+                gender, age_range, age_cat = self.estimate_age_gender(face_roi)
+                
+                # Update age/gender stats
+                if gender == "Male":
+                    if age_cat == "Infant" or age_cat == "Child":
+                        self.stats['boys'] += 1
+                    else:
+                        self.stats['men'] += 1
+                elif gender == "Female":
+                    if age_cat == "Infant" or age_cat == "Child":
+                        self.stats['girls'] += 1
+                    else:
+                        self.stats['women'] += 1
+                
+                # Age category stats
+                if age_cat == "Infant":
+                    self.stats['infants'] += 1
+                elif age_cat == "Child" or age_cat == "Teen":
+                    self.stats['children'] += 1
+                elif age_cat == "Adult":
+                    self.stats['adults'] += 1
+                elif age_cat == "Elderly":
+                    self.stats['elderly'] += 1
+                
+                # Estimate activity
+                center = ((x1 + x2)//2, (y1 + y2)//2)
+                activity = self.estimate_activity(
+                    self.prev_positions.get(idx, None),
+                    center,
+                    size
+                )
+                self.prev_positions[idx] = center
+                
+                # Update activity stats
+                if activity in self.stats['activities']:
+                    self.stats['activities'][activity] += 1
+                else:
+                    self.stats['activities'][activity] = 1
+                
+                total_conf += conf
+                
+                detections.append({
+                    "bbox": (x1, y1, x2, y2),
+                    "confidence": conf,
+                    "size": size,
+                    "category": cat,
+                    "color": info["color"],
+                    "center": center,
+                    "distance": info["distance"],
+                    "gender": gender,
+                    "age_range": age_range,
+                    "age_category": age_cat,
+                    "activity": activity
+                })
+        
+        self.stats['total'] = len(detections)
+        self.last_detections = detections
+        
+        if len(detections) > 0:
+            self.avg_confidence = total_conf / len(detections)
+        else:
+            self.avg_confidence = 0.0
+        
+        return detections
+    
+    def get_category(self, size):
+        for cat, info in self.size_categories.items():
+            if info["range"][0] <= size <= info["range"][1]:
+                return cat, info
+        return "large", self.size_categories["large"]
+    
+    def get_detection_summary(self):
+        """Return list of detections for web display"""
+        return [
+            {
+                "category": d["category"],
+                "distance": d["distance"],
+                "confidence": d["confidence"],
+                "gender": d["gender"],
+                "age": d["age_range"],
+                "activity": d["activity"]
+            }
+            for d in self.last_detections
+        ]
+
+# ===============================
+# HTML TEMPLATE (ENHANCED)
+# ===============================
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>👥 Enhanced Human Detection</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', sans-serif; }
+        body { background: #0a0a0a; color: white; padding: 15px; }
+        .container { max-width: 100%; margin: 0 auto; }
+        h1 { font-size: 1.5rem; text-align: center; margin: 10px 0; color: #00ff88; }
+        .video-container { width: 100%; background: #000; border-radius: 12px; overflow: hidden; margin: 15px 0; }
+        .video-container img { width: 100%; height: auto; }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        
+        .stat-card {
+            background: #1a1a1a;
+            border-radius: 12px;
+            padding: 15px;
+            border-left: 4px solid;
+        }
+        
+        .stat-title { font-size: 0.8rem; color: #888; margin-bottom: 5px; }
+        .stat-number { font-size: 1.8rem; font-weight: bold; }
+        
+        .gender-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        
+        .gender-card {
+            background: #1a1a1a;
+            border-radius: 12px;
+            padding: 15px;
+            text-align: center;
+        }
+        
+        .male { border-left: 4px solid #00aaff; }
+        .female { border-left: 4px solid #ff66aa; }
+        
+        .age-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        
+        .activity-container {
+            background: #1a1a1a;
+            border-radius: 12px;
+            padding: 15px;
+            margin-top: 15px;
+        }
+        
+        .activity-bar {
+            display: flex;
+            margin: 8px 0;
+            align-items: center;
+        }
+        
+        .activity-label { width: 100px; color: #aaa; }
+        .activity-bar-fill {
+            height: 20px;
+            background: #00ff88;
+            border-radius: 10px;
+            margin-left: 10px;
+            color: black;
+            padding: 0 10px;
+            line-height: 20px;
+            font-size: 0.8rem;
+        }
+        
+        .detection-table {
+            background: #1a1a1a;
+            border-radius: 12px;
+            padding: 15px;
+            margin-top: 15px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        
+        .detection-table table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        .detection-table th {
+            text-align: left;
+            color: #00ff88;
+            padding: 8px 0;
+        }
+        
+        .detection-table td {
+            padding: 6px 0;
+            border-bottom: 1px solid #333;
+        }
+        
+        .ip-badge {
+            background: #00ff88;
+            color: black;
+            padding: 10px;
+            border-radius: 20px;
+            text-align: center;
+            margin: 10px 0;
+            font-weight: bold;
+        }
+        
+        .fps { text-align: center; color: #888; font-size: 0.8rem; margin-top: 15px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="ip-badge">
+            📱 Connected to: {{ ip }}:{{ port }}
+        </div>
+        
+        <h1>👥 Enhanced Human Detection</h1>
+        
+        <div class="video-container">
+            <img src="/video_feed" alt="Live Feed">
+        </div>
+        
+        <div class="stats-grid">
+            <div class="stat-card" style="border-left-color: #00ff88;">
+                <div class="stat-title">👥 TOTAL</div>
+                <div class="stat-number">{{ stats.total }}</div>
+            </div>
+            
+            <div class="stat-card" style="border-left-color: #00aaff;">
+                <div class="stat-title">👨 MALES</div>
+                <div class="stat-number">{{ stats.boys + stats.men }}</div>
+            </div>
+            
+            <div class="stat-card" style="border-left-color: #ff66aa;">
+                <div class="stat-title">👩 FEMALES</div>
+                <div class="stat-number">{{ stats.girls + stats.women }}</div>
+            </div>
+        </div>
+        
+        <div class="gender-grid">
+            <div class="gender-card male">
+                <div>👨 Men</div>
+                <div style="font-size: 2rem;">{{ stats.men }}</div>
+            </div>
+            <div class="gender-card female">
+                <div>👩 Women</div>
+                <div style="font-size: 2rem;">{{ stats.women }}</div>
+            </div>
+            <div class="gender-card">
+                <div>👦 Boys</div>
+                <div style="font-size: 1.5rem;">{{ stats.boys }}</div>
+            </div>
+            <div class="gender-card">
+                <div>👧 Girls</div>
+                <div style="font-size: 1.5rem;">{{ stats.girls }}</div>
+            </div>
+        </div>
+        
+        <div class="age-grid">
+            <div class="stat-card" style="border-left-color: #ffaa00;">
+                <div class="stat-title">👶 Infants</div>
+                <div class="stat-number">{{ stats.infants }}</div>
+            </div>
+            <div class="stat-card" style="border-left-color: #ffff00;">
+                <div class="stat-title">🧒 Children</div>
+                <div class="stat-number">{{ stats.children }}</div>
+            </div>
+            <div class="stat-card" style="border-left-color: #00ff00;">
+                <div class="stat-title">🧑 Adults</div>
+                <div class="stat-number">{{ stats.adults }}</div>
+            </div>
+            <div class="stat-card" style="border-left-color: #ff00ff;">
+                <div class="stat-title">👴 Elderly</div>
+                <div class="stat-number">{{ stats.elderly }}</div>
+            </div>
+        </div>
+        
+        <div class="activity-container">
+            <h3>🏃 Activities</h3>
+            {% for activity, count in stats.activities.items() %}
+            <div class="activity-bar">
+                <span class="activity-label">{{ activity }}</span>
+                <div class="activity-bar-fill" style="width: {{ count * 30 }}px;">
+                    {{ count }}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        
+        <div class="detection-table">
+            <h3>📋 Individual Detections</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Gender</th>
+                        <th>Age</th>
+                        <th>Activity</th>
+                        <th>Distance</th>
+                        <th>Confidence</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for det in detections %}
+                    <tr>
+                        <td>{{ loop.index }}</td>
+                        <td>{{ det.gender }}</td>
+                        <td>{{ det.age }}</td>
+                        <td>{{ det.activity }}</td>
+                        <td>{{ det.distance }}</td>
+                        <td>{{ "%.1f"|format(det.confidence*100) }}%</td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="6" style="text-align: center;">No humans detected</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        
+        <div class="fps">
+            FPS: {{ fps }} • Accuracy: {{ "%.1f"|format(avg_conf) }}%
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+# ===============================
+# WEB SERVER CLASS
+# ===============================
+class WebServer:
+    def __init__(self, detector):
+        self.detector = detector
+        self.app = Flask(__name__)
+        self.frame = None
+        self.fps = 0
+        self.proc_time = 0
+        self.setup_routes()
+        
+    def setup_routes(self):
+        @self.app.route('/')
+        def index():
+            return render_template_string(
+                HTML_TEMPLATE,
+                ip=get_local_ip(),
+                port=CONFIG["web_port"],
+                stats=self.detector.stats,
+                detections=self.detector.get_detection_summary(),
+                fps=f"{self.fps:.1f}",
+                avg_conf=self.detector.avg_confidence * 100
+            )
+        
+        @self.app.route('/video_feed')
+        def video_feed():
+            return Response(self.generate_frames(),
+                          mimetype='multipart/x-mixed-replace; boundary=frame')
+        
+        @self.app.route('/stats')
+        def get_stats():
+            return jsonify({
+                'stats': self.detector.stats,
+                'detections': self.detector.get_detection_summary(),
+                'avg_confidence': self.detector.avg_confidence
+            })
+    
+    def generate_frames(self):
+        while True:
+            if self.frame is not None:
+                try:
+                    _, buffer = cv2.imencode('.jpg', self.frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    yield (b'--frame\r\n'
+                          b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                except:
+                    pass
+            time.sleep(0.03)
+    
+    def update_frame(self, frame, fps, proc_time):
+        self.frame = frame
+        self.fps = fps
+        self.proc_time = proc_time
+    
+    def run(self):
+        threading.Thread(target=self.app.run, 
+                        kwargs={'host': CONFIG["web_host"], 
+                               'port': CONFIG["web_port"], 
+                               'debug': False, 
+                               'threaded': True,
+                               'use_reloader': False},
+                        daemon=True).start()
+
+# ===============================
+# UTILITY FUNCTIONS
+# ===============================
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return "127.0.0.1"
+
+def check_python_version():
+    version = sys.version_info
+    print(f"   Python {version.major}.{version.minor}.{version.micro}")
+    return version.major == 3 and version.minor >= 8
+
+def install_requirements():
+    print("\n📦 Installing required libraries...")
+    requirements = [
+        "ultralytics",
+        "opencv-python",
+        "numpy",
+        "mss",
+        "flask",
+        "pillow",
+        "requests"
+    ]
+    
+    for package in requirements:
+        print(f"   Installing {package}...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", package])
+            print(f"   ✅ {package} installed")
+        except:
+            print(f"   ⚠ Failed to install {package}")
+
+# ===============================
+# MAIN FUNCTION
+# ===============================
+def main():
+    print("=" * 70)
+    print("👥 ENHANCED HUMAN DETECTION WITH AGE/GENDER/ACTIVITY")
+    print("=" * 70)
+    
+    # Setup
+    print("\n🛠️  Running setup...")
+    if not check_python_version():
+        print("⚠ Python 3.8+ recommended")
+    
+    install_requirements()
+    
+    # Download pretrained models
+    if CONFIG["auto_download"]:
+        download_pretrained_models()
+    
+    # Initialize detector
+    detector = EnhancedDetector()
+    
+    # Start web server
+    server = WebServer(detector)
+    server.run()
+    
+    # Screen capture
+    sct = mss()
+    screen = CONFIG["screen_region"]
+    
+    # Local window
+    cv2.namedWindow("Enhanced Detection", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Enhanced Detection", 800, 600)
+    
+    # Connection info
+    local_ip = get_local_ip()
+    print("\n" + "=" * 70)
+    print("🌐 WEB INTERFACE ACCESS")
+    print("=" * 70)
+    print(f"📱 Local: http://localhost:{CONFIG['web_port']}")
+    print(f"📱 Network: http://{local_ip}:{CONFIG['web_port']}")
+    print("=" * 70)
+    print("\n✅ RUNNING - Press ESC to exit")
+    
+    # Performance tracking
+    start_time = time.time()
+    frame_count = 0
+    
+    try:
+        while True:
+            frame_start = time.time()
+            
+            # Capture
+            img = sct.grab(screen)
+            frame = np.array(img)
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            
+            # Detect
+            detections = detector.detect(frame)
+            
+            # Draw on frame
+            display = frame.copy()
+            for det in detections:
+                x1, y1, x2, y2 = det["bbox"]
+                color = det["color"]
+                
+                # Draw bounding box
+                cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
+                
+                # Draw info label
+                label = f"{det['gender']} {det['age_category']} {det['activity']}"
+                cv2.putText(display, label, (x1, y1-5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+            
+            # FPS calculation
+            frame_count += 1
+            elapsed = time.time() - start_time
+            fps = frame_count / elapsed if elapsed > 0 else 0
+            proc_time = (time.time() - frame_start) * 1000
+            
+            # Update server
+            server.update_frame(display, fps, proc_time)
+            
+            # Show local window
+            cv2.imshow("Enhanced Detection", display)
+            
+            # Exit on ESC
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+                
+    except KeyboardInterrupt:
+        print("\n\n🛑 Stopped by user")
+    finally:
+        cv2.destroyAllWindows()
+        print("\n✅ Done!")
+
+if __name__ == "__main__":
+    main()
